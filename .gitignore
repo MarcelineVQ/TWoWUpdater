@@ -3,6 +3,7 @@ __pycache__/
 
 # Downloads
 downloads/
+check_results.json
 
 # Built MPQs
 mpqs/

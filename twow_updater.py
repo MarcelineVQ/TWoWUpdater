@@ -487,8 +487,9 @@ def cmd_check(args):
             for f in sorted_files:
                 print(f"    - {f.name} ({f.status})")
 
-    # Save results for download command (in script directory)
-    results_path = SCRIPT_DIR / "check_results.json"
+    # Save results for download command
+    args.download_dir.mkdir(parents=True, exist_ok=True)
+    results_path = args.download_dir / "check_results.json"
     with open(results_path, "w") as f:
         json.dump([{
             "name": r.name,
@@ -504,17 +505,27 @@ def cmd_check(args):
 
 
 def cmd_update(args):
-    """Update command - download updates and build MPQs."""
-    # First download
+    """Update command - check, download updates, and build MPQs."""
+    # First check
     print("=" * 60)
-    print("STEP 1: DOWNLOADING UPDATES")
+    print("STEP 1: CHECKING FOR UPDATES")
+    print("=" * 60)
+
+    all_up_to_date = cmd_check(args)
+    if all_up_to_date:
+        print("\nEverything is up to date, nothing to do.")
+        return True
+
+    # Then download
+    print("\n" + "=" * 60)
+    print("STEP 2: DOWNLOADING UPDATES")
     print("=" * 60)
 
     download_success = cmd_download(args)
 
     # Then build MPQs
     print("\n" + "=" * 60)
-    print("STEP 2: BUILDING MPQs")
+    print("STEP 3: BUILDING MPQs")
     print("=" * 60)
 
     build_success = cmd_build_mpq(args)
@@ -580,7 +591,7 @@ def cmd_download(args):
                                   verify=not args.no_verify, workers=args.workers)
 
     # Normal mode - download outdated files from check results
-    results_path = SCRIPT_DIR / "check_results.json"
+    results_path = args.download_dir / "check_results.json"
 
     if not results_path.exists():
         print("No check results found. Run 'check' command first.")
@@ -725,7 +736,7 @@ def cmd_clean(args):
         removed_files += 1
 
     # Remove check results
-    results_path = SCRIPT_DIR / "check_results.json"
+    results_path = download_dir / "check_results.json"
     if results_path.exists():
         print(f"Removing {results_path}")
         results_path.unlink()

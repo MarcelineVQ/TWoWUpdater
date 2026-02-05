@@ -32,6 +32,8 @@ python twow_updater.py build-mpq   # Build MPQs from downloads
 # Clean up downloads and built MPQs
 python twow_updater.py clean
 ```
+You need to copy the built mpqs yourself, also no exe or dlls are replaced for safety.  
+When you want these updated you must copy them from the downloads/ folder.  
 
 ### Options
 
