@@ -1,0 +1,13 @@
+# Build artifacts
+build/
+.venv/
+__pycache__/
+*.pyc
+
+# Downloads and state
+downloads/
+check_results.json
+.download_state.json
+
+# Built MPQs
+*.mpq
