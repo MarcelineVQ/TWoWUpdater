@@ -1,13 +1,11 @@
 # Build artifacts
-build/
-.venv/
 __pycache__/
-*.pyc
 
-# Downloads and state
+# Downloads
 downloads/
-check_results.json
-.download_state.json
 
 # Built MPQs
-*.mpq
+mpqs/
+
+# Auto-downloaded libraries (fetched on first run)
+lib/

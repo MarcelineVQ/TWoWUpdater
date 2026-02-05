@@ -342,7 +342,7 @@ def _download_single_file(args: tuple, max_retries: int = 3, base_delay: float =
 
 
 def download_outdated(outdated: list[FileStatus], download_dir: Path, mirror: str = DEFAULT_MIRROR,
-                      verify: bool = True, workers: int = 4):
+                      verify: bool = True, workers: int = 10):
     """Download outdated files using parallel downloads."""
     from concurrent.futures import ThreadPoolExecutor, as_completed
     import threading
@@ -671,11 +671,15 @@ def needs_mpq_rebuild(download_dir: Path, patch_key: str) -> bool:
     return False
 
 
-def record_mpq_build(download_dir: Path, patch_key: str):
+def record_mpq_build(download_dir: Path, patch_key: str, output_dir: Path = None):
     """Record that an MPQ was built."""
+    if output_dir is None:
+        output_dir = SCRIPT_DIR / "mpqs"
+
     state = load_download_state(download_dir)
     category = f"patch-{patch_key}"
     source_dir = download_dir / category
+    mpq_path = output_dir / f"{category}.mpq"
 
     files = {}
     for f in source_dir.rglob('*'):
@@ -687,7 +691,7 @@ def record_mpq_build(download_dir: Path, patch_key: str):
         state["mpq_builds"] = {}
 
     state["mpq_builds"][category] = {
-        "built_at": str(os.path.getmtime(download_dir / f"{category}.mpq")) if (download_dir / f"{category}.mpq").exists() else None,
+        "built_at": str(os.path.getmtime(mpq_path)) if mpq_path.exists() else None,
         "files": files
     }
     save_download_state(download_dir, state)
@@ -695,17 +699,23 @@ def record_mpq_build(download_dir: Path, patch_key: str):
 
 def cmd_clean(args):
     """Clean command - remove build MPQs and downloaded files."""
+    import shutil
+
     download_dir = args.download_dir
+    mpq_dir = SCRIPT_DIR / "mpqs"
     removed_files = 0
     removed_dirs = 0
 
-    # Remove built MPQ files
-    for mpq_name in ["patch-8.mpq", "patch-9.mpq"]:
-        mpq_path = download_dir / mpq_name
-        if mpq_path.exists():
-            print(f"Removing {mpq_path}")
-            mpq_path.unlink()
-            removed_files += 1
+    # Remove built MPQ directory
+    if mpq_dir.exists() and mpq_dir.is_dir():
+        mpq_files = list(mpq_dir.glob('*.mpq'))
+        if mpq_files:
+            print(f"Removing built MPQs:")
+            for mpq_file in mpq_files:
+                print(f"  - {mpq_file.name}")
+                removed_files += 1
+        shutil.rmtree(mpq_dir)
+        removed_dirs += 1
 
     # Remove download state file
     state_path = get_download_state_path(download_dir)
@@ -765,7 +775,8 @@ def cmd_build_mpq(args):
 
     args.game_dir = validate_game_dir(args.game_dir)
     download_dir = args.download_dir
-    output_dir = download_dir  # MPQs go in the download dir
+    output_dir = SCRIPT_DIR / "mpqs"  # Built MPQs go here
+    output_dir.mkdir(parents=True, exist_ok=True)
     game_data_dir = args.game_dir / "Data"
 
     # Fetch manifest to know which files should exist
@@ -795,8 +806,8 @@ def cmd_build_mpq(args):
         if source_dir.exists():
             downloaded_files = [f for f in source_dir.rglob('*') if f.is_file()]
 
-        # Check if rebuild needed (only if we have downloads)
-        if downloaded_files and not args.force and not needs_mpq_rebuild(download_dir, patch_key):
+        # Check if rebuild needed
+        if not args.force and not needs_mpq_rebuild(download_dir, patch_key):
             print(f"{category}: Up to date, skipping (use --force to rebuild)")
             continue
 
@@ -807,10 +818,7 @@ def cmd_build_mpq(args):
                 output_path.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(game_mpq_path, output_path)
             else:
-                print(f"\n{category}: No existing MPQ found at {game_mpq_path}")
-                if not downloaded_files:
-                    print(f"  No downloaded files either, skipping")
-                    continue
+                print(f"\n{category}: No existing MPQ found at {game_mpq_path}, will create new")
 
         print(f"\nProcessing {output_path.name}...")
         print(f"  Expected files in manifest: {len(expected_files)}")
@@ -879,7 +887,7 @@ def cmd_build_mpq(args):
                     continue
 
             if downloaded_files:
-                record_mpq_build(download_dir, patch_key)
+                record_mpq_build(download_dir, patch_key, output_dir)
             built_any = True
 
         except Exception as e:
@@ -915,8 +923,8 @@ def main():
     update_parser = subparsers.add_parser("update", help="Download updates and build MPQs (download + build-mpq)")
     update_parser.add_argument("--no-verify", action="store_true",
                                 help="Skip hash verification (use if CDN and manifest are out of sync)")
-    update_parser.add_argument("--workers", "-w", type=int, default=4,
-                                help="Number of parallel downloads (default: 4)")
+    update_parser.add_argument("--workers", "-w", type=int, default=10,
+                                help="Number of parallel downloads (default: 10)")
     update_parser.add_argument("--force", "-f", action="store_true",
                                 help="Force MPQ rebuild even if no changes detected")
 
@@ -936,6 +944,17 @@ def main():
                               help="Force rebuild even if no changes detected")
 
     args = parser.parse_args()
+
+    # Ensure StormLib is available for commands that need it (not for clean or help)
+    if args.command and args.command not in ("clean",):
+        try:
+            import stormlib
+            global HAS_STORMLIB
+            HAS_STORMLIB = True
+        except ImportError as e:
+            print(f"StormLib not available: {e}")
+            print("Some features (MPQ verification/building) will be disabled.")
+            HAS_STORMLIB = False
 
     if args.command == "update":
         success = cmd_update(args)
