@@ -12,7 +12,7 @@ StormLib is automatically downloaded on first run.
 ## Installation
 
 ```bash
-git clone https://github.com/MarcelineVQ/TWoWUpdater
+git clone https://github.com/MarcelineVQ/TWoWUpdater.git
 cd TWoWUpdater
 ```
 
