@@ -24,6 +24,7 @@ python twow_updater.py check
 
 # Download updates and build MPQs in one step
 python twow_updater.py update
+python twow_updater.py --game-dir /games_drive/twmoa_1180/ update
 
 # Or run steps separately:
 python twow_updater.py download    # Download outdated files
