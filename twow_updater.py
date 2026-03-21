@@ -32,7 +32,7 @@ except ImportError:
     HAS_STORMLIB = False
     print("Warning: StormLib not available. Run 'make' to build it.")
 
-MANIFEST_URL = "https://launcher.turtlecraft.gg/api/manifest"
+MANIFEST_URL = "https://launcher.turtlecraft.gg/api/manifest/1172"
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_GAME_DIR = SCRIPT_DIR.parent  # Script is in patch_getter/, game is one level up
 DEFAULT_DOWNLOAD_DIR = SCRIPT_DIR / "downloads"
