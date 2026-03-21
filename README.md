@@ -19,27 +19,27 @@ cd TWoWUpdater
 ## Usage
 
 ```bash
-# Check what needs updating
-python twow_updater.py check
+# Update your game (check, download, build, install)
+python twow_updater.py -g /path/to/TurtleWoW/ update
 
-# Download updates and build MPQs in one step
-python twow_updater.py update
-python twow_updater.py --game-dir /games_drive/twmoa_1180/ update
+# Just check what needs updating
+python twow_updater.py -g /path/to/TurtleWoW/ check
 
-# Or run steps separately:
-python twow_updater.py download    # Download outdated files
-python twow_updater.py build-mpq   # Build MPQs from downloads
+# Run steps separately:
+python twow_updater.py -g /path/to/TurtleWoW/ download
+python twow_updater.py -g /path/to/TurtleWoW/ build
 
 # Clean up downloads and built MPQs
 python twow_updater.py clean
 ```
-You need to copy the built mpqs yourself, also no exe or dlls are replaced for safety.  
-When you want these updated you must copy them from the downloads/ folder.  
+
+If you don't provide `--game-dir`, you'll be prompted for it. The path can be in Linux or Windows format, with or without a trailing `Data/` directory.
 
 ### Options
 
 ```
---game-dir, -g    Game directory
+--game-dir, -g    TurtleWoW game directory (prompted if not set)
+--region, -r      Server region: EU, SEA, SA (default: EU)
 --download-dir    Download directory (default: ./downloads)
 --mirror, -m      CDN mirror: r2eu, bunny, linode, r2, tc (default: r2eu)
 ```
@@ -59,19 +59,25 @@ When you want these updated you must copy them from the downloads/ folder.
 --force, -f       Force rebuild even if no changes detected
 ```
 
-## Output
+## Commands
 
-- Downloaded files go to `downloads/`
-- Built MPQs go to `mpqs/`
-
-After building, copy the MPQs from `mpqs/` to your game's `Data/` directory.
+| Command | Description |
+|---------|-------------|
+| `update` | Full pipeline: check, download, build MPQs, install to game dir |
+| `check` | Verify game files against manifest |
+| `download` | Download outdated files (auto-runs check if needed) |
+| `build` | Build/update MPQs from downloaded files |
+| `clean` | Remove downloads and built MPQs |
 
 ## How it works
 
-1. Fetches the official TurtleWoW manifest
-2. Compares your game files against the manifest
+1. Fetches the official TurtleWoW manifest for your region
+2. Compares your game files against the manifest (client files by hash, patch files inside MPQs)
 3. Downloads changed/missing files from TurtleWoW CDN
-4. Updates your patch MPQs with the new files
+4. Builds updated patch MPQs, only modifying files that actually differ
+5. Installs updated files to your game directory
+
+Stale downloads from previous manifest versions are automatically cleaned. Files already matching the manifest are skipped during both download and build.
 
 ## License
 

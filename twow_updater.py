@@ -32,9 +32,10 @@ except ImportError:
     HAS_STORMLIB = False
     print("Warning: StormLib not available. Run 'make' to build it.")
 
-MANIFEST_URL = "https://launcher.turtlecraft.gg/api/manifest/1172"
+LAUNCHER_API = "https://launcher.turtlecraft.gg/api"
+DEFAULT_REGION = "EU"
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_GAME_DIR = SCRIPT_DIR.parent  # Script is in patch_getter/, game is one level up
+DEFAULT_GAME_DIR = None
 DEFAULT_DOWNLOAD_DIR = SCRIPT_DIR / "downloads"
 DEFAULT_MIRROR = "r2eu"
 MIRROR_ORDER = ["r2eu", "bunny", "linode", "r2", "tc"]
@@ -56,23 +57,91 @@ class FileStatus:
     mirrors: dict = field(default_factory=dict)
 
 
-def validate_game_dir(game_dir: Path) -> Path:
-    """Validate that game_dir contains WoW.exe. Returns resolved path or exits with error."""
-    game_dir = game_dir.resolve()
-    wow_exe = game_dir / "WoW.exe"
+def normalize_path(path_str: str) -> Path:
+    """Normalize a path from either Windows or Linux format."""
+    # Strip quotes and whitespace
+    path_str = path_str.strip().strip('"').strip("'")
+    # Convert backslashes to forward slashes for Windows paths
+    path_str = path_str.replace('\\', '/')
+    # Handle Wine/Proton drive letter paths (e.g. Z:/home/... or C:/Games/...)
+    if len(path_str) >= 3 and path_str[1] == ':' and path_str[2] == '/':
+        drive = path_str[0].upper()
+        if drive == 'Z':
+            # Z: is typically mapped to / in Wine
+            path_str = path_str[2:]
+        elif drive == 'C':
+            # Try common Wine prefix paths
+            path_str = path_str[2:]  # Strip C: and hope it's relative or user fixes it
+    # Strip trailing Data/ - user may have pointed at the Data subdirectory
+    path_str = path_str.rstrip('/')
+    if path_str.lower().endswith('/data'):
+        path_str = path_str[:-5]
+    return Path(path_str)
 
-    if not wow_exe.exists():
-        print(f"Error: WoW.exe not found in {game_dir}", file=sys.stderr)
-        print(f"Please specify a valid game directory with --game-dir", file=sys.stderr)
-        sys.exit(1)
+
+def find_wow_exe(game_dir: Path) -> Optional[Path]:
+    """Find WoW.exe in a directory. Tries case-insensitive name match first,
+    then falls back to scanning .exe files for the TurtleWoW version string."""
+    import re
+    try:
+        exe_files = [f for f in game_dir.iterdir() if f.suffix.lower() == '.exe' and f.is_file()]
+    except OSError:
+        return None
+
+    # First pass: case-insensitive name match
+    for f in exe_files:
+        if f.name.lower() == "wow.exe":
+            return f
+
+    # Second pass: scan .exe files for the TurtleWoW version signature
+    for f in exe_files:
+        try:
+            data = f.read_bytes()
+            if re.search(rb'\d{4,5}\x00+\d+\.\d+\.\d+\x00+RELEASE_BUILD', data):
+                return f
+        except OSError:
+            continue
+
+    return None
+
+
+def validate_game_dir(game_dir: Optional[Path]) -> Path:
+    """Validate that game_dir contains WoW.exe. Returns resolved path or prompts if not found."""
+    if game_dir is not None:
+        game_dir = game_dir.resolve()
+
+    while game_dir is None or find_wow_exe(game_dir) is None:
+        if game_dir is not None:
+            print(f"WoW.exe not found in {game_dir}")
+        try:
+            user_input = input("Enter your TurtleWoW game directory: ")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            sys.exit(1)
+        game_dir = normalize_path(user_input).resolve()
 
     return game_dir
 
 
-def fetch_manifest() -> dict:
+def resolve_region(region: str) -> str:
+    """Validate region against the API's region list, returning the canonical casing."""
+    url = f"{LAUNCHER_API}/versions"
+    req = urllib.request.Request(url, headers={"User-Agent": "TurtleWoW-Updater/1.0"})
+    with urllib.request.urlopen(req, timeout=10) as response:
+        versions = json.loads(response.read().decode())
+    lookup = {v.upper(): v for v in versions}
+    canonical = lookup.get(region.upper())
+    if canonical is None:
+        print(f"Error: Unknown region '{region}'. Available: {', '.join(versions)}", file=sys.stderr)
+        sys.exit(1)
+    return canonical
+
+
+def fetch_manifest(region: str) -> dict:
     """Fetch the manifest from the launcher API."""
-    print(f"Fetching manifest from {MANIFEST_URL}...")
-    req = urllib.request.Request(MANIFEST_URL, headers={"User-Agent": "TurtleWoW-Updater/1.0"})
+    url = f"{LAUNCHER_API}/manifest/{region}"
+    print(f"Fetching manifest from {url}...")
+    req = urllib.request.Request(url, headers={"User-Agent": "TurtleWoW-Updater/1.0"})
     with urllib.request.urlopen(req, timeout=30) as response:
         return json.loads(response.read().decode())
 
@@ -451,7 +520,8 @@ def build_mpq(patch_key: str, download_dir: Path, output_path: Path):
 def cmd_check(args):
     """Check command - verify game files."""
     args.game_dir = validate_game_dir(args.game_dir)
-    manifest = fetch_manifest()
+    region = resolve_region(args.region)
+    manifest = fetch_manifest(region)
 
     print(f"\nGame directory: {args.game_dir}")
     print("\n" + "=" * 60)
@@ -504,8 +574,62 @@ def cmd_check(args):
     return outdated_count == 0
 
 
+def merge_dlls_txt(new_file: Path, existing_file: Path):
+    """Merge new dlls.txt entries into the existing one.
+
+    Adds entries from new_file that aren't already present in existing_file.
+    Respects commented-out entries -- if a DLL is commented out (e.g. #nampower.dll)
+    it's treated as intentionally disabled and won't be re-added."""
+    new_lines = new_file.read_text().splitlines()
+    new_entries = set()
+    for line in new_lines:
+        stripped = line.strip()
+        if stripped and not stripped.startswith('#'):
+            new_entries.add(stripped.lower())
+
+    if not existing_file.exists():
+        # No existing file, just copy
+        import shutil
+        existing_file.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(new_file, existing_file)
+        print(f"  {existing_file.name} (created)")
+        return
+
+    existing_text = existing_file.read_text()
+    existing_lines = existing_text.splitlines()
+
+    # Build set of all DLL names present in existing file (active or commented)
+    existing_names = set()
+    for line in existing_lines:
+        # Strip any leading # characters and whitespace to get the bare name
+        name = line.lstrip('#').strip().lower()
+        if name:
+            existing_names.add(name)
+
+    # Find entries in new that aren't in existing at all (not even commented)
+    to_add = []
+    for entry in sorted(new_entries):
+        if entry not in existing_names:
+            to_add.append(entry)
+
+    if not to_add:
+        return
+
+    # Append new entries
+    content = existing_text
+    if not content.endswith('\n'):
+        content += '\n'
+    for entry in to_add:
+        content += entry + '\n'
+
+    existing_file.write_text(content)
+    print(f"  {existing_file.name} (added {len(to_add)} entries: {', '.join(to_add)})")
+
+
 def cmd_update(args):
-    """Update command - check, download updates, and build MPQs."""
+    """Update command - check, download, build MPQs, and install to game directory."""
+    import shutil
+
     # First check
     print("=" * 60)
     print("STEP 1: CHECKING FOR UPDATES")
@@ -523,14 +647,104 @@ def cmd_update(args):
 
     download_success = cmd_download(args)
 
-    # Then build MPQs
+    # Build MPQs only if there are outdated patch files
+    results_path = args.download_dir / "check_results.json"
+    with open(results_path) as f:
+        results = [FileStatus(**r) for r in json.load(f)]
+    patch_outdated = [r for r in get_outdated_files(results) if r.category.startswith("patch-")]
+
+    build_success = True
+    if patch_outdated:
+        print("\n" + "=" * 60)
+        print("STEP 3: BUILDING MPQs")
+        print("=" * 60)
+
+        args.force = True
+        build_success = cmd_build_mpq(args)
+
+    # Install files that differ by absence or hash
     print("\n" + "=" * 60)
-    print("STEP 3: BUILDING MPQs")
+    print("STEP 4: INSTALLING TO GAME DIRECTORY")
     print("=" * 60)
 
-    build_success = cmd_build_mpq(args)
+    installed = 0
+
+    def install_if_changed(src: Path, dest: Path):
+        """Copy src to dest only if dest is missing or has a different hash."""
+        nonlocal installed
+        if dest.exists():
+            if sha256_file(src) == sha256_file(dest):
+                return
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        print(f"  {dest.relative_to(args.game_dir)}")
+        shutil.copy2(src, dest)
+        installed += 1
+
+    # Install built MPQs (patch-8, patch-9)
+    mpq_dir = SCRIPT_DIR / "mpqs"
+    game_data_dir = args.game_dir / "Data"
+    for mpq_file in sorted(mpq_dir.glob("*.mpq")):
+        install_if_changed(mpq_file, game_data_dir / mpq_file.name)
+
+    # Install client files (full MPQs, DLLs, etc.)
+    client_dir = args.download_dir / "client"
+    if client_dir.exists():
+        for f in client_dir.rglob('*'):
+            if not f.is_file():
+                continue
+            rel = f.relative_to(client_dir)
+            dest = args.game_dir / rel
+            if f.name.lower() == "dlls.txt":
+                merge_dlls_txt(f, dest)
+                installed += 1
+            else:
+                install_if_changed(f, dest)
+
+    if installed:
+        print(f"\nInstalled {installed} file(s)")
+    else:
+        print("\nNothing to install, game files already match")
 
     return download_success and build_success
+
+
+def clean_stale_downloads(manifest: dict, download_dir: Path):
+    """Remove downloaded files that aren't in the manifest or have wrong hashes."""
+    # Build map of expected files per category: name -> hash
+    expected = {}
+    for patch in manifest.get("patches", []):
+        category = f"patch-{patch['key']}"
+        expected[category] = {}
+        for item in patch.get("files", []):
+            if item.get("type") == "file" and item.get("hash"):
+                expected[category][item["name"]] = item["hash"].upper()
+
+    removed = 0
+    for category, expected_files in expected.items():
+        cat_dir = download_dir / category
+        if not cat_dir.exists():
+            continue
+        for f in list(cat_dir.rglob('*')):
+            if not f.is_file():
+                continue
+            rel = str(f.relative_to(cat_dir))
+            if rel not in expected_files:
+                f.unlink()
+                removed += 1
+            else:
+                # Check hash matches
+                actual_hash = sha256_file(f)
+                if actual_hash != expected_files[rel]:
+                    print(f"  Removing stale: {rel}")
+                    f.unlink()
+                    removed += 1
+        # Clean empty dirs
+        for d in sorted(cat_dir.rglob('*'), reverse=True):
+            if d.is_dir() and not any(d.iterdir()):
+                d.rmdir()
+
+    if removed:
+        print(f"Cleaned {removed} stale file(s) from downloads")
 
 
 def cmd_download(args):
@@ -538,12 +752,15 @@ def cmd_download(args):
 
     if getattr(args, 'all', False):
         # Download all manifest files mode
+        region = resolve_region(args.region)
         print("Fetching manifest...")
         try:
-            manifest = fetch_manifest()
+            manifest = fetch_manifest(region)
         except Exception as e:
             print(f"Error fetching manifest: {e}")
             return False
+
+        clean_stale_downloads(manifest, args.download_dir)
 
         # Collect all files from manifest
         files_to_download = []
@@ -590,13 +807,12 @@ def cmd_download(args):
         return download_outdated(files_to_download, args.download_dir, args.mirror,
                                   verify=not args.no_verify, workers=args.workers)
 
-    # Normal mode - download outdated files from check results
+    # Normal mode - download outdated files, auto-run check if needed
     results_path = args.download_dir / "check_results.json"
 
     if not results_path.exists():
-        print("No check results found. Run 'check' command first.")
-        print("Or use --all to download all manifest files.")
-        return False
+        print("No check results found, running check first...\n")
+        cmd_check(args)
 
     with open(results_path) as f:
         results_data = json.load(f)
@@ -607,6 +823,11 @@ def cmd_download(args):
     if not outdated:
         print("All files are up to date!")
         return True
+
+    # Clean stale downloads using the manifest
+    region = resolve_region(args.region)
+    manifest = fetch_manifest(region)
+    clean_stale_downloads(manifest, args.download_dir)
 
     return download_outdated(outdated, args.download_dir, args.mirror, verify=not args.no_verify, workers=args.workers)
 
@@ -763,15 +984,16 @@ def cmd_clean(args):
     return True
 
 
-def get_expected_patch_files(manifest: dict, patch_key: str) -> set[str]:
-    """Get the set of files that should exist in a patch from the manifest."""
-    expected = set()
+def get_expected_patch_files(manifest: dict, patch_key: str) -> dict[str, str]:
+    """Get expected files for a patch from the manifest. Returns {name: hash}."""
+    expected = {}
     for patch in manifest.get("patches", []):
         if patch["key"] == patch_key:
             for item in patch.get("files", []):
                 if item.get("type") == "file":
                     # Normalize to backslashes for MPQ comparison
-                    expected.add(item["name"].replace("/", "\\"))
+                    name = item["name"].replace("/", "\\")
+                    expected[name] = item.get("hash", "").upper()
             break
     return expected
 
@@ -785,6 +1007,7 @@ def cmd_build_mpq(args):
     import shutil
 
     args.game_dir = validate_game_dir(args.game_dir)
+    region = resolve_region(args.region)
     download_dir = args.download_dir
     output_dir = SCRIPT_DIR / "mpqs"  # Built MPQs go here
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -793,7 +1016,7 @@ def cmd_build_mpq(args):
     # Fetch manifest to know which files should exist
     print("Fetching manifest to determine expected files...")
     try:
-        manifest = fetch_manifest()
+        manifest = fetch_manifest(region)
     except Exception as e:
         print(f"Error fetching manifest: {e}")
         return False
@@ -855,7 +1078,7 @@ def cmd_build_mpq(args):
                 current_files = set(archive.list_files())
 
                 # Find files to remove (in MPQ but not in manifest)
-                to_remove = current_files - expected_files
+                to_remove = current_files - set(expected_files.keys())
                 if to_remove:
                     print(f"  Removing {len(to_remove)} obsolete files...")
                     removed = 0
@@ -867,25 +1090,38 @@ def cmd_build_mpq(args):
                             print(f"    Warning: Could not remove {filename}: {e}")
                     print(f"    Removed {removed} files")
 
-                # Add/update downloaded files
+                # Add/update downloaded files only if MPQ copy differs
                 added = 0
                 updated = 0
+                skipped = 0
                 if downloaded_files:
-                    print(f"  Adding/updating {len(downloaded_files)} downloaded files...")
                     for file_path in downloaded_files:
                         rel_path = file_path.relative_to(source_dir)
                         archive_name = str(rel_path).replace('/', '\\')
+                        expected_hash = expected_files.get(archive_name, "")
 
                         existed = archive.has_file(archive_name)
-                        archive.add_file(file_path, archive_name)
+                        if existed and expected_hash:
+                            # Check if MPQ already has the right version
+                            try:
+                                mpq_data = archive.read_file(archive_name)
+                                if sha256_bytes(mpq_data) == expected_hash:
+                                    skipped += 1
+                                    continue
+                            except Exception:
+                                pass
 
+                        archive.add_file(file_path, archive_name)
                         if existed:
                             updated += 1
                         else:
                             added += 1
 
                 archive.close()
-                print(f"  ✓ Updated {output_path.name}: {added} added, {updated} replaced, {len(to_remove)} removed")
+                if added or updated or to_remove:
+                    print(f"  ✓ Updated {output_path.name}: {added} added, {updated} replaced, {len(to_remove)} removed")
+                else:
+                    print(f"  ✓ {output_path.name}: up to date")
             else:
                 # Create new MPQ from downloaded files (rebuild case or no existing MPQ)
                 if downloaded_files:
@@ -908,7 +1144,6 @@ def cmd_build_mpq(args):
 
     if built_any:
         print(f"\nMPQ files ready in: {output_dir}")
-        print("To use them, copy to your game's Data/ directory")
     else:
         print("\nNo MPQs were built")
 
@@ -921,17 +1156,19 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
 
-    parser.add_argument("--game-dir", "-g", type=Path, default=DEFAULT_GAME_DIR,
-                        help=f"Game directory (default: {DEFAULT_GAME_DIR})")
+    parser.add_argument("--game-dir", "-g", type=normalize_path, default=DEFAULT_GAME_DIR,
+                        help="TurtleWoW game directory (will prompt if not set)")
     parser.add_argument("--download-dir", "-d", type=Path, default=DEFAULT_DOWNLOAD_DIR,
                         help=f"Download directory (default: {DEFAULT_DOWNLOAD_DIR})")
     parser.add_argument("--mirror", "-m", choices=MIRROR_ORDER, default=DEFAULT_MIRROR,
                         help=f"CDN mirror (default: {DEFAULT_MIRROR})")
+    parser.add_argument("--region", "-r", default=DEFAULT_REGION,
+                        help=f"Server region (default: {DEFAULT_REGION})")
 
     subparsers = parser.add_subparsers(dest="command", help="Command to run")
 
     # Update command (most common operation) - listed first
-    update_parser = subparsers.add_parser("update", help="Download updates and build MPQs (download + build-mpq)")
+    update_parser = subparsers.add_parser("update", help="Check, download, build, and install updates")
     update_parser.add_argument("--no-verify", action="store_true",
                                 help="Skip hash verification (use if CDN and manifest are out of sync)")
     update_parser.add_argument("--workers", "-w", type=int, default=10,
@@ -949,7 +1186,7 @@ def main():
                                   help="Download all manifest files, not just outdated ones")
     download_parser.add_argument("--include-mpq", action="store_true",
                                   help="Include .mpq files when using --all (excluded by default)")
-    build_parser = subparsers.add_parser("build-mpq", help="Build MPQs from downloaded files")
+    build_parser = subparsers.add_parser("build", help="Build MPQs from downloaded files")
     clean_parser = subparsers.add_parser("clean", help="Remove build MPQs and downloaded files")
     build_parser.add_argument("--force", "-f", action="store_true",
                               help="Force rebuild even if no changes detected")
@@ -976,7 +1213,7 @@ def main():
     elif args.command == "download":
         success = cmd_download(args)
         sys.exit(0 if success else 1)
-    elif args.command == "build-mpq":
+    elif args.command == "build":
         cmd_build_mpq(args)
     elif args.command == "clean":
         cmd_clean(args)
