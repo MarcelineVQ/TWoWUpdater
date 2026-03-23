@@ -232,40 +232,57 @@ def check_patch_files(manifest: dict, game_dir: Path) -> list[FileStatus]:
 
         checked = 0
 
-        for item in files_in_patch:
-            name = item["name"]
+        expected_names = {f["name"].replace("/", "\\") for f in files_in_patch}
 
-            status = FileStatus(
-                name=name,
-                expected_hash=item["hash"].upper(),
-                expected_size=item["size"],
-                category=patch_name,
-                mirrors=item.get("mirrors", {})
-            )
+        with archive:
+            # Check manifest files exist and match
+            for item in files_in_patch:
+                name = item["name"]
 
-            try:
-                if not archive.has_file(name):
-                    status.status = "missing"
-                else:
-                    # Read and hash the file
-                    data = archive.read_file(name)
+                status = FileStatus(
+                    name=name,
+                    expected_hash=item["hash"].upper(),
+                    expected_size=item["size"],
+                    category=patch_name,
+                    mirrors=item.get("mirrors", {})
+                )
 
-                    status.actual_size = len(data)
-                    status.actual_hash = sha256_bytes(data)
-
-                    if status.actual_hash == status.expected_hash:
-                        status.status = "ok"
+                try:
+                    if not archive.has_file(name):
+                        status.status = "missing"
                     else:
-                        status.status = "hash_mismatch"
-            except Exception as e:
-                status.status = "error"
+                        # Read and hash the file
+                        data = archive.read_file(name)
 
-            results.append(status)
-            checked += 1
-            if checked % 500 == 0:
-                print(f"    Checked {checked}/{len(files_in_patch)} files...")
+                        status.actual_size = len(data)
+                        status.actual_hash = sha256_bytes(data)
 
-        archive.close()
+                        if status.actual_hash == status.expected_hash:
+                            status.status = "ok"
+                        else:
+                            status.status = "hash_mismatch"
+                except Exception as e:
+                    status.status = "error"
+
+                results.append(status)
+                checked += 1
+                if checked % 500 == 0:
+                    print(f"    Checked {checked}/{len(files_in_patch)} files...")
+
+            # Check for extra files not in manifest
+            mpq_files = set(archive.list_files())
+            extras = mpq_files - expected_names
+            if extras:
+                print(f"    Found {len(extras)} extra file(s) not in manifest")
+                for name in sorted(extras):
+                    results.append(FileStatus(
+                        name=name,
+                        expected_hash="",
+                        expected_size=0,
+                        status="extra",
+                        category=patch_name,
+                    ))
+
         print(f"    Checked {checked} files")
 
     return results
@@ -289,21 +306,27 @@ def print_status_summary(results: list[FileStatus]):
     for category, counts in sorted(by_category.items()):
         ok = counts.get("ok", 0)
         outdated = counts.get("missing", 0) + counts.get("hash_mismatch", 0) + counts.get("size_mismatch", 0)
+        extra = counts.get("extra", 0)
         total_ok += ok
-        total_outdated += outdated
+        total_outdated += outdated + extra
 
-        status_str = "✓ UP TO DATE" if outdated == 0 else f"✗ {outdated} OUTDATED"
+        problems = []
+        if outdated:
+            problems.append(f"{outdated} outdated")
+        if extra:
+            problems.append(f"{extra} extra")
+        status_str = "✓ UP TO DATE" if not problems else "✗ " + ", ".join(problems)
         print(f"  {category}: {ok} ok, {status_str}")
 
     print("-" * 60)
-    print(f"  TOTAL: {total_ok} files OK, {total_outdated} files need updating")
+    print(f"  TOTAL: {total_ok} files OK, {total_outdated} files need fixing")
 
     return total_outdated
 
 
 def get_outdated_files(results: list[FileStatus]) -> list[FileStatus]:
-    """Get list of files that need updating."""
-    return [r for r in results if r.status in ("missing", "hash_mismatch", "size_mismatch")]
+    """Get list of files that need updating (missing, wrong hash, or extra)."""
+    return [r for r in results if r.status in ("missing", "hash_mismatch", "size_mismatch", "extra")]
 
 
 def download_file(url: str, dest_path: Path, expected_hash: str = None, expected_size: int = None,
@@ -621,10 +644,13 @@ def cmd_update(args):
     """Update command - check, download, build MPQs, and install to game directory."""
     import shutil
 
-    # Clear downloads to avoid stale files from previous runs
+    # Clear downloads and built MPQs to avoid stale files from previous runs
     if args.download_dir.exists():
         shutil.rmtree(args.download_dir)
         args.download_dir.mkdir(parents=True)
+    mpq_dir = SCRIPT_DIR / "mpqs"
+    if mpq_dir.exists():
+        shutil.rmtree(mpq_dir)
 
     # First check
     print("=" * 60)
@@ -825,7 +851,12 @@ def cmd_download(args):
     manifest = fetch_manifest(region)
     clean_stale_downloads(manifest, args.download_dir)
 
-    return download_outdated(outdated, args.download_dir, args.mirror, verify=not args.no_verify, workers=args.workers)
+    # Extra files only need removing from MPQ, not downloading
+    to_download = [f for f in outdated if f.status != "extra"]
+    if not to_download:
+        return True
+
+    return download_outdated(to_download, args.download_dir, args.mirror, verify=not args.no_verify, workers=args.workers)
 
 
 def get_download_state_path(download_dir: Path) -> Path:
@@ -1055,65 +1086,61 @@ def cmd_build_mpq(args):
 
         try:
             needs_rebuild = False
-            current_files = set()
 
             if output_path.exists():
                 # Check current MPQ capacity
-                archive = stormlib.MPQArchive(output_path, mode='a')
-                current_files = set(archive.list_files())
-                print(f"  Current files in MPQ: {len(current_files)}")
+                with stormlib.MPQArchive(output_path, mode='r') as archive:
+                    current_files = set(archive.list_files())
+                    print(f"  Current files in MPQ: {len(current_files)}")
 
-                # If MPQ is nearly empty but we need many files, rebuild from scratch
                 if len(current_files) < 100 and len(expected_files) > 1000:
                     print(f"  MPQ too small for {len(expected_files)} files, will rebuild...")
-                    archive.close()
                     needs_rebuild = True
 
             if output_path.exists() and not needs_rebuild:
-                archive = stormlib.MPQArchive(output_path, mode='a')
-                current_files = set(archive.list_files())
+                with stormlib.MPQArchive(output_path, mode='a') as archive:
+                    current_files = set(archive.list_files())
 
-                # Find files to remove (in MPQ but not in manifest)
-                to_remove = current_files - set(expected_files.keys())
-                if to_remove:
-                    print(f"  Removing {len(to_remove)} obsolete files...")
-                    removed = 0
-                    for filename in to_remove:
-                        try:
-                            archive.remove_file(filename)
-                            removed += 1
-                        except Exception as e:
-                            print(f"    Warning: Could not remove {filename}: {e}")
-                    print(f"    Removed {removed} files")
-
-                # Add/update downloaded files only if MPQ copy differs
-                added = 0
-                updated = 0
-                skipped = 0
-                if downloaded_files:
-                    for file_path in downloaded_files:
-                        rel_path = file_path.relative_to(source_dir)
-                        archive_name = str(rel_path).replace('/', '\\')
-                        expected_hash = expected_files.get(archive_name, "")
-
-                        existed = archive.has_file(archive_name)
-                        if existed and expected_hash:
-                            # Check if MPQ already has the right version
+                    # Find files to remove (in MPQ but not in manifest)
+                    to_remove = current_files - set(expected_files.keys())
+                    if to_remove:
+                        print(f"  Removing {len(to_remove)} obsolete files...")
+                        removed = 0
+                        for filename in to_remove:
                             try:
-                                mpq_data = archive.read_file(archive_name)
-                                if sha256_bytes(mpq_data) == expected_hash:
-                                    skipped += 1
-                                    continue
-                            except Exception:
-                                pass
+                                archive.remove_file(filename)
+                                removed += 1
+                            except Exception as e:
+                                print(f"    Warning: Could not remove {filename}: {e}")
+                        print(f"    Removed {removed} files")
 
-                        archive.add_file(file_path, archive_name)
-                        if existed:
-                            updated += 1
-                        else:
-                            added += 1
+                    # Add/update downloaded files only if MPQ copy differs
+                    added = 0
+                    updated = 0
+                    skipped = 0
+                    if downloaded_files:
+                        for file_path in downloaded_files:
+                            rel_path = file_path.relative_to(source_dir)
+                            archive_name = str(rel_path).replace('/', '\\')
+                            expected_hash = expected_files.get(archive_name, "")
 
-                archive.close()
+                            existed = archive.has_file(archive_name)
+                            if existed and expected_hash:
+                                # Check if MPQ already has the right version
+                                try:
+                                    mpq_data = archive.read_file(archive_name)
+                                    if sha256_bytes(mpq_data) == expected_hash:
+                                        skipped += 1
+                                        continue
+                                except Exception:
+                                    pass
+
+                            archive.add_file(file_path, archive_name)
+                            if existed:
+                                updated += 1
+                            else:
+                                added += 1
+
                 if added or updated or to_remove:
                     print(f"  ✓ Updated {output_path.name}: {added} added, {updated} replaced, {len(to_remove)} removed")
                 else:
