@@ -29,8 +29,8 @@ def _get_platform_lib_info():
 
     if system == "linux" and machine in ("x86_64", "amd64"):
         return "libstorm.so", f"{STORMLIB_RELEASE_URL}/{STORMLIB_LINUX_DEB}", "deb"
-    elif system == "windows" and machine in ("x86_64", "amd64", "amd64"):
-        return "storm.dll", f"{STORMLIB_RELEASE_URL}/{STORMLIB_WINDOWS_ZIP}", "zip"
+    elif system == "windows" and machine in ("x86_64", "amd64", "x86", "i386", "i686"):
+        return "StormLib.dll", f"{STORMLIB_RELEASE_URL}/{STORMLIB_WINDOWS_ZIP}", "zip"
     else:
         return None, None, None
 
@@ -83,19 +83,24 @@ def _download_and_extract_stormlib():
             import zipfile
             import shutil
 
-            with zipfile.ZipFile(pkg_path, 'r') as zf:
+            with zipfile.ZipFile(pkg_path, "r") as zf:
                 zf.extractall(tmpdir)
 
-            # Find storm.dll (usually in x64 subfolder for 64-bit)
-            for dll_file in tmpdir.rglob("storm.dll"):
-                # Prefer x64 version
-                if "x64" in str(dll_file.parent).lower() or "64" in str(dll_file.parent):
-                    shutil.copy2(dll_file, lib_path)
-                    print(f"Extracted {lib_name} to {lib_path}")
-                    return lib_path
+            # StormLib release zip contains Win32/ and x64/ folders
+            is_64bit = sys.maxsize > 2**32 or machine in ("x86_64", "amd64")
+            preferred_dirs = ["x64"] if is_64bit else ["win32"]
+            fallback_dirs = ["win32"] if is_64bit else ["x64"]
 
-            # Fallback to any storm.dll found
-            for dll_file in tmpdir.rglob("storm.dll"):
+            for folder_name in preferred_dirs + fallback_dirs:
+                for dll_file in tmpdir.rglob("StormLib.dll"):
+                    parent_parts = [p.lower() for p in dll_file.parent.parts]
+                    if folder_name in parent_parts:
+                        shutil.copy2(dll_file, lib_path)
+                        print(f"Extracted {lib_name} to {lib_path}")
+                        return lib_path
+
+            # Final fallback: any StormLib.dll anywhere in the zip
+            for dll_file in tmpdir.rglob("StormLib.dll"):
                 shutil.copy2(dll_file, lib_path)
                 print(f"Extracted {lib_name} to {lib_path}")
                 return lib_path
@@ -116,7 +121,7 @@ def _load_stormlib():
             Path("/usr/lib") / lib_name,
         ]
     elif system == "windows":
-        lib_name = "storm.dll"
+        lib_name = "StormLib.dll"
         search_paths = [
             LIB_DIR / lib_name,
             SCRIPT_DIR / lib_name,
