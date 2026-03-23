@@ -6,7 +6,7 @@ Auto-downloads prebuilt StormLib from GitHub releases if not found locally.
 """
 
 import ctypes
-from ctypes import c_bool, c_char_p, c_uint32, c_uint64, c_void_p, byref, POINTER
+from ctypes import c_bool, c_char_p, c_wchar_p, c_uint32, c_uint64, c_void_p, byref, POINTER
 from pathlib import Path
 import os
 import platform
@@ -152,7 +152,13 @@ HANDLE = c_void_p
 DWORD = c_uint32
 LCID = c_uint32
 ULONGLONG = c_uint64
-TCHAR = c_char_p
+_WINDOWS = platform.system().lower() == "windows"
+TCHAR = c_wchar_p if _WINDOWS else c_char_p
+
+
+def _tchar(s: str):
+    """Convert a filesystem path string to the type TCHAR expects."""
+    return s if _WINDOWS else s.encode('utf-8')
 
 # Constants for MPQ creation
 MPQ_CREATE_LISTFILE = 0x00100000
@@ -285,19 +291,19 @@ class MPQArchive:
         self.handle = HANDLE()
         self._closed = False
 
-        path_bytes = str(self.path).encode('utf-8')
+        path_arg = _tchar(str(self.path))
 
         if mode == 'r':
-            if not _lib.SFileOpenArchive(path_bytes, 0, MPQ_OPEN_READ_ONLY, byref(self.handle)):
+            if not _lib.SFileOpenArchive(path_arg, 0, MPQ_OPEN_READ_ONLY, byref(self.handle)):
                 raise StormLibError(f"Failed to open archive: {path}")
         elif mode == 'w':
             if max_files == 0:
                 max_files = 4096  # Default
             flags = MPQ_CREATE_LISTFILE | MPQ_CREATE_ATTRIBUTES | MPQ_CREATE_ARCHIVE_V1
-            if not _lib.SFileCreateArchive(path_bytes, flags, max_files, byref(self.handle)):
+            if not _lib.SFileCreateArchive(path_arg, flags, max_files, byref(self.handle)):
                 raise StormLibError(f"Failed to create archive: {path}")
         elif mode == 'a':
-            if not _lib.SFileOpenArchive(path_bytes, 0, 0, byref(self.handle)):
+            if not _lib.SFileOpenArchive(path_arg, 0, 0, byref(self.handle)):
                 raise StormLibError(f"Failed to open archive for writing: {path}")
         else:
             raise ValueError(f"Invalid mode: {mode}")
@@ -331,11 +337,11 @@ class MPQArchive:
         if self.mode == 'r':
             raise StormLibError("Archive opened in read-only mode")
 
-        source_bytes = str(source_path).encode('utf-8')
+        source_arg = _tchar(str(source_path))
         # Convert forward slashes to backslashes for MPQ paths
         archive_bytes = archive_name.replace('/', '\\').encode('utf-8')
 
-        if not _lib.SFileAddFileEx(self.handle, source_bytes, archive_bytes,
+        if not _lib.SFileAddFileEx(self.handle, source_arg, archive_bytes,
                                    flags, compression, compression):
             raise StormLibError(f"Failed to add file: {source_path} -> {archive_name}")
 

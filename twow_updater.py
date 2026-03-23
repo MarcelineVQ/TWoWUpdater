@@ -58,25 +58,16 @@ class FileStatus:
 
 
 def normalize_path(path_str: str) -> Path:
-    """Normalize a path from either Windows or Linux format."""
+    """Clean up a user-provided path: strip quotes, trailing Data/, expand ~."""
     # Strip quotes and whitespace
-    path_str = path_str.strip().strip('"').strip("'")
-    # Convert backslashes to forward slashes for Windows paths
-    path_str = path_str.replace('\\', '/')
-    # Handle Wine/Proton drive letter paths (e.g. Z:/home/... or C:/Games/...)
-    if len(path_str) >= 3 and path_str[1] == ':' and path_str[2] == '/':
-        drive = path_str[0].upper()
-        if drive == 'Z':
-            # Z: is typically mapped to / in Wine
-            path_str = path_str[2:]
-        elif drive == 'C':
-            # Try common Wine prefix paths
-            path_str = path_str[2:]  # Strip C: and hope it's relative or user fixes it
+    while len(path_str) > 1 and (path_str[0] in '"\'') and path_str[-1] == path_str[0]:
+        path_str = path_str[1:-1]
+    path_str = path_str.strip()
     # Strip trailing Data/ - user may have pointed at the Data subdirectory
-    path_str = path_str.rstrip('/')
-    if path_str.lower().endswith('/data'):
-        path_str = path_str[:-5]
-    return Path(path_str)
+    stripped = path_str.rstrip('/').rstrip('\\')
+    if stripped.lower().endswith(('/data', '\\data')):
+        stripped = stripped[:-5]
+    return Path(stripped or path_str).expanduser()
 
 
 def find_wow_exe(game_dir: Path) -> Optional[Path]:
@@ -629,6 +620,11 @@ def merge_dlls_txt(new_file: Path, existing_file: Path):
 def cmd_update(args):
     """Update command - check, download, build MPQs, and install to game directory."""
     import shutil
+
+    # Clear downloads to avoid stale files from previous runs
+    if args.download_dir.exists():
+        shutil.rmtree(args.download_dir)
+        args.download_dir.mkdir(parents=True)
 
     # First check
     print("=" * 60)
