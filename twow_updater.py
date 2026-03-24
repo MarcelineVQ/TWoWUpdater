@@ -152,16 +152,16 @@ def sha256_bytes(data: bytes) -> str:
 
 
 def check_client_files(manifest: dict, game_dir: Path) -> list[FileStatus]:
-    """Check client files (full MPQ hashes)."""
+    """Check client files (full MPQ hashes), hashing concurrently."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    items = [i for i in manifest.get("client", []) if i.get("type") == "file" and i.get("hash")]
     results = []
+    to_hash = []
 
-    for item in manifest.get("client", []):
-        if item.get("type") != "file" or not item.get("hash"):
-            continue
-
+    for item in items:
         name = item["name"]
         filepath = game_dir / name
-
         status = FileStatus(
             name=name,
             expected_hash=item["hash"].upper(),
@@ -169,121 +169,141 @@ def check_client_files(manifest: dict, game_dir: Path) -> list[FileStatus]:
             category="client",
             mirrors=item.get("mirrors", {})
         )
-
         if not filepath.exists():
             status.status = "missing"
+            results.append(status)
         else:
-            status.actual_size = filepath.stat().st_size
-            if status.actual_size != status.expected_size:
-                status.status = "size_mismatch"
-            else:
-                print(f"  Hashing {name}...", end="", flush=True)
-                status.actual_hash = sha256_file(filepath)
-                if status.actual_hash == status.expected_hash:
-                    status.status = "ok"
-                    print(" OK")
-                else:
-                    status.status = "hash_mismatch"
-                    print(" MISMATCH")
+            to_hash.append((filepath, status))
 
-        results.append(status)
+    # Largest first so all threads start on big files immediately
+    to_hash.sort(key=lambda x: x[0].stat().st_size, reverse=True)
+
+    if to_hash:
+        def hash_one(filepath, status):
+            status.actual_hash = sha256_file(filepath)
+            status.actual_size = filepath.stat().st_size
+            status.status = "ok" if status.actual_hash == status.expected_hash else "hash_mismatch"
+            return status
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = {pool.submit(hash_one, fp, st): st.name for fp, st in to_hash}
+            done = 0
+            for future in as_completed(futures):
+                done += 1
+                status = future.result()
+                mark = "OK" if status.status == "ok" else "MISMATCH"
+                print(f"  [{done}/{len(to_hash)}] {futures[future]} {mark}")
+                results.append(status)
 
     return results
 
 
+def _check_single_patch(patch: dict, game_dir: Path) -> list[FileStatus]:
+    """Check files inside a single patch MPQ. Runs in its own thread."""
+    patch_key = patch["key"]
+    patch_name = f"patch-{patch_key}"
+    mpq_path = game_dir / "Data" / f"{patch_name}.mpq"
+
+    files_in_patch = [f for f in patch.get("files", []) if f.get("type") == "file"]
+    if not files_in_patch:
+        return []
+
+    results = []
+
+    if not mpq_path.exists():
+        print(f"  {mpq_path.name}: MISSING")
+        for item in files_in_patch:
+            results.append(FileStatus(
+                name=item["name"],
+                expected_hash=item["hash"].upper(),
+                expected_size=item["size"],
+                status="missing",
+                category=patch_name,
+                mirrors=item.get("mirrors", {})
+            ))
+        return results
+
+    print(f"  Checking {mpq_path.name} ({len(files_in_patch)} files)...")
+
+    try:
+        archive = stormlib.MPQArchive(mpq_path, mode='r')
+    except Exception as e:
+        print(f"    Error opening {mpq_path}: {e}")
+        return results
+
+    checked = 0
+    expected_names = {f["name"].replace("/", "\\") for f in files_in_patch}
+
+    with archive:
+        for item in files_in_patch:
+            name = item["name"]
+
+            status = FileStatus(
+                name=name,
+                expected_hash=item["hash"].upper(),
+                expected_size=item["size"],
+                category=patch_name,
+                mirrors=item.get("mirrors", {})
+            )
+
+            try:
+                if not archive.has_file(name):
+                    status.status = "missing"
+                else:
+                    data = archive.read_file(name)
+                    status.actual_size = len(data)
+                    status.actual_hash = sha256_bytes(data)
+
+                    if status.actual_hash == status.expected_hash:
+                        status.status = "ok"
+                    else:
+                        status.status = "hash_mismatch"
+            except Exception as e:
+                status.status = "error"
+
+            results.append(status)
+            checked += 1
+            if checked % 500 == 0:
+                print(f"    [{patch_name}] Checked {checked}/{len(files_in_patch)} files...")
+
+        # Check for extra files not in manifest
+        mpq_files = set(archive.list_files())
+        extras = mpq_files - expected_names
+        if extras:
+            print(f"    [{patch_name}] Found {len(extras)} extra file(s) not in manifest")
+            for name in sorted(extras):
+                results.append(FileStatus(
+                    name=name,
+                    expected_hash="",
+                    expected_size=0,
+                    status="extra",
+                    category=patch_name,
+                ))
+
+    print(f"    [{patch_name}] Checked {checked} files")
+    return results
+
+
 def check_patch_files(manifest: dict, game_dir: Path) -> list[FileStatus]:
-    """Check files inside patch-8 and patch-9 MPQs using StormLib."""
+    """Check files inside patch MPQs using StormLib, checking patches in parallel."""
     if not HAS_STORMLIB:
         print("Warning: StormLib not available, skipping patch-8/9 verification")
         print("         Run 'make' to build StormLib support")
         return []
 
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    patches = [p for p in manifest.get("patches", [])
+               if any(f.get("type") == "file" for f in p.get("files", []))]
+
+    if not patches:
+        return []
+
     results = []
-
-    for patch in manifest.get("patches", []):
-        patch_key = patch["key"]
-        patch_name = f"patch-{patch_key}"
-        mpq_path = game_dir / "Data" / f"{patch_name}.mpq"
-
-        files_in_patch = [f for f in patch.get("files", []) if f.get("type") == "file"]
-        if not files_in_patch:
-            continue  # Skip empty patches like patch-Z
-
-        if not mpq_path.exists():
-            print(f"  {mpq_path.name}: MISSING")
-            for item in files_in_patch:
-                results.append(FileStatus(
-                    name=item["name"],
-                    expected_hash=item["hash"].upper(),
-                    expected_size=item["size"],
-                    status="missing",
-                    category=patch_name,
-                    mirrors=item.get("mirrors", {})
-                ))
-            continue
-
-        print(f"  Checking {mpq_path.name} ({len(files_in_patch)} files)...")
-
-        try:
-            archive = stormlib.MPQArchive(mpq_path, mode='r')
-        except Exception as e:
-            print(f"    Error opening {mpq_path}: {e}")
-            continue
-
-        checked = 0
-
-        expected_names = {f["name"].replace("/", "\\") for f in files_in_patch}
-
-        with archive:
-            # Check manifest files exist and match
-            for item in files_in_patch:
-                name = item["name"]
-
-                status = FileStatus(
-                    name=name,
-                    expected_hash=item["hash"].upper(),
-                    expected_size=item["size"],
-                    category=patch_name,
-                    mirrors=item.get("mirrors", {})
-                )
-
-                try:
-                    if not archive.has_file(name):
-                        status.status = "missing"
-                    else:
-                        # Read and hash the file
-                        data = archive.read_file(name)
-
-                        status.actual_size = len(data)
-                        status.actual_hash = sha256_bytes(data)
-
-                        if status.actual_hash == status.expected_hash:
-                            status.status = "ok"
-                        else:
-                            status.status = "hash_mismatch"
-                except Exception as e:
-                    status.status = "error"
-
-                results.append(status)
-                checked += 1
-                if checked % 500 == 0:
-                    print(f"    Checked {checked}/{len(files_in_patch)} files...")
-
-            # Check for extra files not in manifest
-            mpq_files = set(archive.list_files())
-            extras = mpq_files - expected_names
-            if extras:
-                print(f"    Found {len(extras)} extra file(s) not in manifest")
-                for name in sorted(extras):
-                    results.append(FileStatus(
-                        name=name,
-                        expected_hash="",
-                        expected_size=0,
-                        status="extra",
-                        category=patch_name,
-                    ))
-
-        print(f"    Checked {checked} files")
+    with ThreadPoolExecutor(max_workers=len(patches)) as pool:
+        futures = {pool.submit(_check_single_patch, p, game_dir): p["key"] for p in patches}
+        for future in as_completed(futures):
+            results.extend(future.result())
 
     return results
 
