@@ -20,14 +20,21 @@ cd TWoWUpdater
 
 ```bash
 # Update your game (check, download, build, install)
-python twow_updater.py -g /path/to/TurtleWoW/ update
+python twow_updater.py update
+python twow_updater.py update -g /path/to/TurtleWoW/
+
+# Update and strip redundant files from MPQs to save disk space
+python twow_updater.py update --strip
+
+# Restore full MPQs (remove strip, then re-download originals)
+python twow_updater.py update --unstrip
 
 # Just check what needs updating
-python twow_updater.py -g /path/to/TurtleWoW/ check
+python twow_updater.py check
 
-# Run steps separately:
-python twow_updater.py -g /path/to/TurtleWoW/ download
-python twow_updater.py -g /path/to/TurtleWoW/ build
+# Run steps separately
+python twow_updater.py download
+python twow_updater.py build
 
 # Clean up downloads and built MPQs
 python twow_updater.py clean
@@ -42,6 +49,16 @@ If you don't provide `--game-dir`, you'll be prompted for it. The path can be in
 --region, -r      Server region: EU, SEA, SA (default: EU)
 --download-dir    Download directory (default: ./downloads)
 --mirror, -m      CDN mirror: r2eu, bunny, linode, r2, tc (default: r2eu)
+```
+
+### Update options
+
+```
+--strip           Strip redundant files from MPQs after updating
+--unstrip         Restore full MPQs before updating (removes strip markers)
+--force, -f       Force MPQ rebuild even if no changes detected
+--no-verify       Skip hash verification (use if CDN is out of sync)
+--workers, -w     Parallel downloads (default: 10)
 ```
 
 ### Download options
@@ -78,6 +95,14 @@ If you don't provide `--game-dir`, you'll be prompted for it. The path can be in
 5. Installs updated files to your game directory
 
 Stale downloads from previous manifest versions are automatically cleaned. Files already matching the manifest are skipped during both download and build.
+
+## Stripping
+
+WoW 1.12's MPQ system loads files by priority: `patch-9` overrides `patch-8`, which overrides `patch-7`, and so on down to the base archives. Many files exist in multiple MPQs but only the highest-priority copy is ever loaded.
+
+`update --strip` removes these redundant copies and compacts the archives, typically saving 2+ GB of disk space. A `.stripped` marker is added to each modified MPQ so the updater knows the hash mismatch is intentional.
+
+`update --unstrip` removes the markers, causing the next update to re-download the original full MPQs. Both flags can be combined: `update --unstrip --strip` restores originals then re-strips after updating.
 
 ## License
 

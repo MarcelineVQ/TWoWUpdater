@@ -492,7 +492,10 @@ def create_mpq_from_directory(mpq_path: str | Path, source_dir: str | Path,
     files = [f for f in files if f.is_file()]
 
     if max_files == 0:
-        max_files = max(len(files) + 100, 1024)  # Add some padding
+        # MPQ hash tables need power-of-2 size with headroom for collisions
+        max_files = 1024
+        while max_files < len(files) * 2:
+            max_files *= 2
 
     # Remove existing MPQ
     if mpq_path.exists():

@@ -43,6 +43,20 @@ MIRROR_ORDER = ["r2eu", "bunny", "linode", "r2", "tc"]
 # MPQEditor path for building MPQs
 MPQEDITOR_PATH = Path("/home/august/projects/wtools-Tools/MPQEditor 3.5.0.733/MPQEditor.exe")
 
+# WoW 1.12 MPQ load order: highest priority first.
+# File_FindInArchive (0x6549a0) searches the archive array from count-1 down to 0.
+# Patches are registered after base archives, and sorted case-insensitively,
+# so patch-9 has highest priority. patch.MPQ is opened before the patch-X glob.
+# Base archives are loaded by fixed index from filename table at 0x82e12c.
+MPQ_LOAD_ORDER = [
+    # Patches: discovered via glob, sorted case-insensitively, last = highest priority
+    "patch-9", "patch-8", "patch-7", "patch-6",
+    "patch-5", "patch-4", "patch-3", "patch-2", "patch",
+    # Base archives: loaded by index from filename table at 0x82e12c
+    "model", "texture", "terrain", "wmo", "sound",
+    "misc", "interface", "fonts", "speech", "dbc",
+]
+
 
 @dataclass
 class FileStatus:
@@ -180,6 +194,17 @@ def check_client_files(manifest: dict, game_dir: Path) -> list[FileStatus]:
 
     if to_hash:
         def hash_one(filepath, status):
+            # If this is an MPQ with a .stripped sentinel, accept the hash mismatch
+            if filepath.suffix.lower() == ".mpq" and HAS_STORMLIB:
+                try:
+                    with stormlib.MPQArchive(filepath, mode='r') as a:
+                        if a.has_file('.stripped'):
+                            status.status = "ok"
+                            status.actual_size = filepath.stat().st_size
+                            return status
+                except Exception:
+                    pass
+
             status.actual_hash = sha256_file(filepath)
             status.actual_size = filepath.stat().st_size
             status.status = "ok" if status.actual_hash == status.expected_hash else "hash_mismatch"
@@ -268,7 +293,7 @@ def _check_single_patch(patch: dict, game_dir: Path) -> list[FileStatus]:
 
         # Check for extra files not in manifest
         mpq_files = set(archive.list_files())
-        extras = mpq_files - expected_names
+        extras = mpq_files - expected_names - {'.stripped'}
         if extras:
             print(f"    [{patch_name}] Found {len(extras)} extra file(s) not in manifest")
             for name in sorted(extras):
@@ -304,6 +329,46 @@ def check_patch_files(manifest: dict, game_dir: Path) -> list[FileStatus]:
         futures = {pool.submit(_check_single_patch, p, game_dir): p["key"] for p in patches}
         for future in as_completed(futures):
             results.extend(future.result())
+
+    # Resolve stripped files: only for MPQs that have a .stripped sentinel.
+    # If a file is "missing" from a stripped patch but a higher-priority patch
+    # has it AND that copy passed its own hash check, mark it ok.
+    stripped_patches = set()
+    data_dir = game_dir / "Data"
+    for patch in patches:
+        mpq_path = data_dir / f"patch-{patch['key']}.mpq"
+        if not mpq_path.exists():
+            continue
+        try:
+            with stormlib.MPQArchive(mpq_path, mode='r') as a:
+                if a.has_file('.stripped'):
+                    stripped_patches.add(f"patch-{patch['key']}")
+        except Exception:
+            pass
+
+    if stripped_patches:
+        patch_priority = {n: i for i, n in enumerate(MPQ_LOAD_ORDER)}
+
+        # Map: lowercase filename -> (priority, category) of highest-priority verified copy
+        verified_owner = {}
+        for r in results:
+            if r.status == "ok":
+                key = r.name.lower().replace("/", "\\")
+                prio = patch_priority.get(r.category, 999)
+                if key not in verified_owner or prio < verified_owner[key][0]:
+                    verified_owner[key] = (prio, r.category)
+
+        resolved = 0
+        for r in results:
+            if r.status == "missing" and r.category in stripped_patches:
+                key = r.name.lower().replace("/", "\\")
+                my_prio = patch_priority.get(r.category, 999)
+                if key in verified_owner and verified_owner[key][0] < my_prio:
+                    r.status = "ok"
+                    resolved += 1
+
+        if resolved:
+            print(f"  {resolved} missing file(s) verified in higher-priority patches (stripped)")
 
     return results
 
@@ -664,6 +729,17 @@ def cmd_update(args):
     """Update command - check, download, build MPQs, and install to game directory."""
     import shutil
 
+    do_unstrip_flag = getattr(args, 'unstrip', False)
+    do_strip_flag = getattr(args, 'strip', False)
+
+    # Unstrip before update so check sees the real hashes
+    if do_unstrip_flag and HAS_STORMLIB:
+        print("=" * 60)
+        print("UNSTRIPPING MPQs")
+        print("=" * 60)
+        do_unstrip(args.game_dir, verbose=False)
+        print()
+
     # Clear downloads and built MPQs to avoid stale files from previous runs
     if args.download_dir.exists():
         shutil.rmtree(args.download_dir)
@@ -679,7 +755,11 @@ def cmd_update(args):
 
     all_up_to_date = cmd_check(args)
     if all_up_to_date:
-        print("\nEverything is up to date, nothing to do.")
+        if do_strip_flag and HAS_STORMLIB:
+            print("\nStripping redundant MPQ files...")
+            do_strip(args.game_dir, verbose=False)
+        else:
+            print("\nEverything is up to date.")
         return True
 
     # Then download
@@ -722,11 +802,14 @@ def cmd_update(args):
         shutil.copy2(src, dest)
         installed += 1
 
-    # Install built MPQs (patch-8, patch-9)
+    # Install built MPQs
     mpq_dir = SCRIPT_DIR / "mpqs"
     game_data_dir = args.game_dir / "Data"
-    for mpq_file in sorted(mpq_dir.glob("*.mpq")):
-        install_if_changed(mpq_file, game_data_dir / mpq_file.name)
+    for mpq_file in sorted(mpq_dir.glob("*.mpq")) + sorted(mpq_dir.glob("*.MPQ")):
+        # Match existing filename case in game dir
+        existing = find_mpq(game_data_dir, mpq_file.stem)
+        dest = existing if existing else game_data_dir / mpq_file.name
+        install_if_changed(mpq_file, dest)
 
     # Install client files (full MPQs, DLLs, etc.)
     client_dir = args.download_dir / "client"
@@ -746,6 +829,11 @@ def cmd_update(args):
         print(f"\nInstalled {installed} file(s)")
     else:
         print("\nNothing to install, game files already match")
+
+    # Strip after install
+    if do_strip_flag and HAS_STORMLIB:
+        print("\nStripping redundant MPQ files...")
+        do_strip(args.game_dir, verbose=False)
 
     return download_success and build_success
 
@@ -1113,8 +1201,8 @@ def cmd_build_mpq(args):
                     current_files = set(archive.list_files())
                     print(f"  Current files in MPQ: {len(current_files)}")
 
-                if len(current_files) < 100 and len(expected_files) > 1000:
-                    print(f"  MPQ too small for {len(expected_files)} files, will rebuild...")
+                if len(current_files) < len(expected_files) // 2:
+                    print(f"  MPQ has {len(current_files)} files but needs {len(expected_files)}, will rebuild...")
                     needs_rebuild = True
 
             if output_path.exists() and not needs_rebuild:
@@ -1166,15 +1254,50 @@ def cmd_build_mpq(args):
                 else:
                     print(f"  ✓ {output_path.name}: up to date")
             else:
-                # Create new MPQ from downloaded files (rebuild case or no existing MPQ)
-                if downloaded_files:
-                    if output_path.exists():
-                        output_path.unlink()  # Remove small/corrupt MPQ
-                    count = stormlib.create_mpq_from_directory(output_path, source_dir)
-                    print(f"  ✓ Created {output_path.name} with {count} files")
-                else:
+                # Rebuild: new MPQ with enough capacity, carry forward existing good files, add downloads
+                if not downloaded_files and not output_path.exists():
                     print(f"  ✗ Cannot create MPQ without downloaded files")
                     continue
+
+                old_mpq = None
+                if output_path.exists():
+                    old_mpq = output_path.with_suffix('.mpq.old')
+                    output_path.rename(old_mpq)
+
+                max_files = 1
+                while max_files < len(expected_files) * 2:
+                    max_files *= 2
+                with stormlib.MPQArchive(output_path, mode='w', max_files=max_files) as archive:
+                    # Carry forward files from old MPQ that are still expected
+                    carried = 0
+                    if old_mpq:
+                        expected_lower = {k.lower() for k in expected_files}
+                        with stormlib.MPQArchive(old_mpq, mode='r') as old_archive:
+                            for f in old_archive.list_files():
+                                if f.lower().replace('/', '\\') in expected_lower:
+                                    try:
+                                        data = old_archive.read_file(f)
+                                        archive.add_data(data, f)
+                                        carried += 1
+                                    except Exception:
+                                        pass
+                        if carried:
+                            print(f"  Carried {carried} existing files from old MPQ")
+
+                    # Add/overlay downloaded files
+                    added = 0
+                    if downloaded_files:
+                        for file_path in downloaded_files:
+                            rel_path = file_path.relative_to(source_dir)
+                            archive_name = str(rel_path).replace('/', '\\')
+                            archive.add_file(file_path, archive_name)
+                            added += 1
+                            if added % 500 == 0:
+                                print(f"  Added {added}/{len(downloaded_files)} downloaded files...")
+
+                print(f"  ✓ Created {output_path.name}: {carried} carried, {added} new ({carried + added} total)")
+                if old_mpq and old_mpq.exists():
+                    old_mpq.unlink()
 
             if downloaded_files:
                 record_mpq_build(download_dir, patch_key, output_dir)
@@ -1193,34 +1316,188 @@ def cmd_build_mpq(args):
     return True
 
 
+def find_mpq(data_dir: Path, name: str) -> Optional[Path]:
+    """Find an MPQ file case-insensitively in the Data directory."""
+    for f in data_dir.iterdir():
+        if f.name.lower() == name.lower() + ".mpq":
+            return f
+    return None
+
+
+
+def scan_mpq_load_order(game_dir: Path) -> list[tuple[Path, list[str]]]:
+    """Scan all MPQs in load order, returning (path, file_list) pairs.
+    Highest priority first."""
+    data_dir = game_dir / "Data"
+    result = []
+    for name in MPQ_LOAD_ORDER:
+        mpq_path = find_mpq(data_dir, name)
+        if mpq_path is None:
+            continue
+        try:
+            with stormlib.MPQArchive(mpq_path, mode='r') as a:
+                files = a.list_files()
+            result.append((mpq_path, files))
+        except Exception as e:
+            print(f"  Warning: could not open {mpq_path.name}: {e}")
+    return result
+
+
+def do_strip(game_dir: Path, verbose: bool = True, dry_run: bool = False) -> bool:
+    """Strip redundant files from MPQs. Can be called standalone or from update."""
+    if verbose:
+        print("Scanning MPQs in load order...")
+    mpq_data = scan_mpq_load_order(game_dir)
+    if not mpq_data:
+        return True
+
+    seen = set()
+    redundant = {}
+    for mpq_path, files in mpq_data:
+        to_remove = []
+        for f in files:
+            if f == '.stripped':
+                continue
+            key = f.lower()
+            if key in seen:
+                to_remove.append(f)
+            else:
+                seen.add(key)
+        if to_remove:
+            redundant[mpq_path] = to_remove
+
+    total_redundant = sum(len(v) for v in redundant.values())
+    if not redundant:
+        print("Everything is up to date, no redundant files.")
+        return True
+
+    if verbose:
+        total_bytes = 0
+        for mpq_path, files in sorted(redundant.items(), key=lambda x: -len(x[1])):
+            mpq_bytes = 0
+            try:
+                with stormlib.MPQArchive(mpq_path, mode='r') as a:
+                    for f in files:
+                        try:
+                            mpq_bytes += len(a.read_file(f))
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            total_bytes += mpq_bytes
+            print(f"  {mpq_path.name}: {len(files)} files ({mpq_bytes / 1024 / 1024:.1f} MB)")
+        print(f"  Total: {total_redundant} files, {total_bytes / 1024 / 1024:.0f} MB recoverable")
+
+    if dry_run:
+        print("\nDry run -- no changes made.")
+        return True
+
+    return _do_strip(redundant, verbose=verbose)
+
+
+def do_unstrip(game_dir: Path, verbose: bool = True) -> int:
+    """Remove .stripped sentinels. Returns count of sentinels removed."""
+    data_dir = game_dir / "Data"
+    removed = 0
+    for f in sorted(list(data_dir.glob("*.MPQ")) + list(data_dir.glob("*.mpq"))):
+        try:
+            with stormlib.MPQArchive(f, mode='a') as a:
+                if a.has_file('.stripped'):
+                    a.remove_file('.stripped')
+                    removed += 1
+                    if verbose:
+                        print(f"  {f.name}: removed .stripped")
+        except Exception:
+            pass
+    if removed:
+        print(f"Removed .stripped from {removed} MPQ(s).")
+    return removed
+
+
+
+def _strip_single_mpq(mpq_path: Path, files_to_remove: list[str]) -> tuple[str, int, int]:
+    """Remove redundant files from an MPQ and compact it. Returns (name, removed_count, bytes_saved)."""
+    old_size = mpq_path.stat().st_size
+
+    try:
+        with stormlib.MPQArchive(mpq_path, mode='a') as archive:
+            removed = 0
+            for f in files_to_remove:
+                try:
+                    archive.remove_file(f)
+                    removed += 1
+                except Exception:
+                    pass
+            if not archive.has_file('.stripped'):
+                archive.add_data(b'', '.stripped')
+            archive.compact()
+
+        new_size = mpq_path.stat().st_size
+        saved = old_size - new_size
+        return (mpq_path.name, removed, saved)
+
+    except Exception as e:
+        print(f"  {mpq_path.name}: Error: {e}")
+        return (mpq_path.name, 0, 0)
+
+
+def _do_strip(redundant: dict[Path, list[str]], verbose: bool = True) -> bool:
+    """Strip MPQs in parallel using remove+compact."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = {pool.submit(_strip_single_mpq, path, files): path.name
+                   for path, files in redundant.items()}
+
+        total_removed = 0
+        total_saved = 0
+        for future in as_completed(futures):
+            name, removed, saved = future.result()
+            total_removed += removed
+            total_saved += saved
+            print(f"  {name}: -{removed} files, -{saved / 1024 / 1024:.1f} MB")
+
+    print(f"Stripped {total_removed} redundant files, saved {total_saved / 1024 / 1024:.0f} MB.")
+    return True
+
+
+
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="TurtleWoW Update Checker & Downloader",
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
 
-    parser.add_argument("--game-dir", "-g", type=normalize_path, default=DEFAULT_GAME_DIR,
+    # Shared arguments available on all subcommands
+    shared = argparse.ArgumentParser(add_help=False)
+    shared.add_argument("--game-dir", "-g", type=normalize_path, default=DEFAULT_GAME_DIR,
                         help="TurtleWoW game directory (will prompt if not set)")
-    parser.add_argument("--download-dir", "-d", type=Path, default=DEFAULT_DOWNLOAD_DIR,
+    shared.add_argument("--download-dir", "-d", type=Path, default=DEFAULT_DOWNLOAD_DIR,
                         help=f"Download directory (default: {DEFAULT_DOWNLOAD_DIR})")
-    parser.add_argument("--mirror", "-m", choices=MIRROR_ORDER, default=DEFAULT_MIRROR,
+    shared.add_argument("--mirror", "-m", choices=MIRROR_ORDER, default=DEFAULT_MIRROR,
                         help=f"CDN mirror (default: {DEFAULT_MIRROR})")
-    parser.add_argument("--region", "-r", default=DEFAULT_REGION,
+    shared.add_argument("--region", "-r", default=DEFAULT_REGION,
                         help=f"Server region (default: {DEFAULT_REGION})")
 
     subparsers = parser.add_subparsers(dest="command", help="Command to run")
 
     # Update command (most common operation) - listed first
-    update_parser = subparsers.add_parser("update", help="Check, download, build, and install updates")
+    update_parser = subparsers.add_parser("update", parents=[shared], help="Check, download, build, and install updates")
     update_parser.add_argument("--no-verify", action="store_true",
                                 help="Skip hash verification (use if CDN and manifest are out of sync)")
     update_parser.add_argument("--workers", "-w", type=int, default=10,
                                 help="Number of parallel downloads (default: 10)")
     update_parser.add_argument("--force", "-f", action="store_true",
                                 help="Force MPQ rebuild even if no changes detected")
+    update_parser.add_argument("--strip", action="store_true",
+                                help="Strip redundant files from MPQs after updating")
+    update_parser.add_argument("--unstrip", action="store_true",
+                                help="Remove .stripped sentinels before updating (restores full MPQs)")
 
-    check_parser = subparsers.add_parser("check", help="Check game files for updates")
-    download_parser = subparsers.add_parser("download", help="Download outdated files")
+    check_parser = subparsers.add_parser("check", parents=[shared], help="Check game files for updates")
+    download_parser = subparsers.add_parser("download", parents=[shared], help="Download outdated files")
     download_parser.add_argument("--no-verify", action="store_true",
                                   help="Skip hash verification (use if CDN and manifest are out of sync)")
     download_parser.add_argument("--workers", "-w", type=int, default=10,
@@ -1229,10 +1506,11 @@ def main():
                                   help="Download all manifest files, not just outdated ones")
     download_parser.add_argument("--include-mpq", action="store_true",
                                   help="Include .mpq files when using --all (excluded by default)")
-    build_parser = subparsers.add_parser("build", help="Build MPQs from downloaded files")
-    clean_parser = subparsers.add_parser("clean", help="Remove build MPQs and downloaded files")
+    build_parser = subparsers.add_parser("build", parents=[shared], help="Build MPQs from downloaded files")
+    clean_parser = subparsers.add_parser("clean", parents=[shared], help="Remove build MPQs and downloaded files")
     build_parser.add_argument("--force", "-f", action="store_true",
                               help="Force rebuild even if no changes detected")
+
 
     args = parser.parse_args()
 
