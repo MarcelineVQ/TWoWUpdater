@@ -72,16 +72,19 @@ class FileStatus:
 
 
 def normalize_path(path_str: str) -> Path:
-    """Clean up a user-provided path: strip quotes, trailing Data/, expand ~."""
+    """Clean up a user-provided path: strip quotes, trailing Data/, files, expand ~."""
     # Strip quotes and whitespace
     while len(path_str) > 1 and (path_str[0] in '"\'') and path_str[-1] == path_str[0]:
         path_str = path_str[1:-1]
     path_str = path_str.strip()
+    p = Path(path_str).expanduser()
+    # If user pointed at a file, use its parent directory
+    if p.is_file():
+        p = p.parent
     # Strip trailing Data/ - user may have pointed at the Data subdirectory
-    stripped = path_str.rstrip('/').rstrip('\\')
-    if stripped.lower().endswith(('/data', '\\data')):
-        stripped = stripped[:-5]
-    return Path(stripped or path_str).expanduser()
+    if p.name.lower() == 'data':
+        p = p.parent
+    return p
 
 
 def find_wow_exe(game_dir: Path) -> Optional[Path]:
@@ -118,8 +121,9 @@ def validate_game_dir(game_dir: Optional[Path]) -> Path:
     while game_dir is None or find_wow_exe(game_dir) is None:
         if game_dir is not None:
             print(f"WoW.exe not found in {game_dir}")
+        example = r"C:\Games\TurtleWoW" if sys.platform == "win32" else "/path/to/TurtleWoW"
         try:
-            user_input = input("Enter your TurtleWoW game directory: ")
+            user_input = input(f"Enter your TurtleWoW game directory (e.g. {example}): ")
         except (EOFError, KeyboardInterrupt):
             print()
             sys.exit(1)
