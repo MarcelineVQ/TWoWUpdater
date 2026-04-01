@@ -9,12 +9,24 @@ Launcherless TurtleWoW updating. Fetches and compiles new MPQ changes.
 
 StormLib is automatically downloaded on first run.
 
-## Installation
+## Quick Start
+
+### Windows
+
+1. Install [Python 3](https://www.python.org/downloads/) (check **Add Python to PATH** during install)
+2. [Download](https://github.com/MarcelineVQ/TWoWUpdater/archive/refs/heads/master.zip) or clone this repo
+3. Double-click **update.bat**
+4. Paste your TurtleWoW game directory when prompted
+
+### Linux
 
 ```bash
 git clone https://github.com/MarcelineVQ/TWoWUpdater.git
 cd TWoWUpdater
+python3 twow_updater.py update
 ```
+
+You'll be prompted for your game directory if you don't pass `--game-dir`.
 
 ## Usage
 
@@ -40,7 +52,7 @@ python twow_updater.py build
 python twow_updater.py clean
 ```
 
-If you don't provide `--game-dir`, you'll be prompted for it. The path can be in Linux or Windows format, with or without a trailing `Data/` directory.
+The game directory path can be in Linux or Windows format, with or without a trailing `Data/` directory.
 
 ### Options
 
