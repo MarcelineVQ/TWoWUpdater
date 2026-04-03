@@ -117,8 +117,6 @@ def _load_stormlib():
         search_paths = [
             LIB_DIR / lib_name,
             SCRIPT_DIR / "build" / "install" / "lib" / lib_name,
-            Path("/usr/local/lib") / lib_name,
-            Path("/usr/lib") / lib_name,
         ]
     elif system == "windows":
         lib_name = "StormLib.dll"
@@ -136,6 +134,25 @@ def _load_stormlib():
                 return ctypes.CDLL(str(path))
             except OSError:
                 continue
+
+    # Try system library search (LD_LIBRARY_PATH, ld.so.cache, etc.)
+    if system == "linux":
+        from ctypes.util import find_library
+        found = find_library("storm")
+        if found:
+            try:
+                return ctypes.CDLL(found)
+            except OSError:
+                pass
+
+        # NixOS store fallback
+        nix_store = Path("/nix/store")
+        if nix_store.exists():
+            for path in nix_store.glob("*stormlib*/lib/" + lib_name):
+                try:
+                    return ctypes.CDLL(str(path))
+                except OSError:
+                    continue
 
     # Not found - try to download
     try:

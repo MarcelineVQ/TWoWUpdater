@@ -7,7 +7,7 @@ Launcherless TurtleWoW updating. Fetches and compiles new MPQ changes.
 - Python 3.10+
 - Linux (x64) or Windows (x64)
 
-StormLib is automatically downloaded on first run.
+StormLib is automatically downloaded (if needed) on first run.
 
 ## Quick Start
 
